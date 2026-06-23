@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from joblib import Parallel, delayed
 from imblearn.over_sampling import SMOTE
 from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.under_sampling import RandomUnderSampler
@@ -104,6 +105,12 @@ def parse_args() -> argparse.Namespace:
             "Modo rapido para iteracao local: reduz folds para 3, desativa SVM e limita "
             "linhas (se --max-rows nao for informado)."
         ),
+    )
+    parser.add_argument(
+        "--n-jobs",
+        type=int,
+        default=-1,
+        help="Numero de jobs para paralelismo em validacao cruzada. -1 usa todos os nucleos.",
     )
     return parser.parse_args()
 
@@ -290,12 +297,59 @@ def build_pipeline(model: Any, use_scaler: bool, sampler: Any) -> ImbPipeline:
     return ImbPipeline(steps=steps)
 
 
+def _process_fold(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    idx_train: np.ndarray,
+    idx_test: np.ndarray,
+    model: Any,
+    scale: bool,
+    sampler: Any,
+    scenario_name: str,
+    model_name: str,
+    fold_id: int,
+) -> dict[str, Any]:
+    """Processa um único fold (executado em paralelo)."""
+    x_train, x_test = x_values[idx_train], x_values[idx_test]
+    y_train, y_test = y_values[idx_train], y_values[idx_test]
+
+    sampler_instance = clone(sampler) if sampler is not None else None
+    model_instance = clone(model)
+    pipe = build_pipeline(
+        model=model_instance,
+        use_scaler=bool(scale),
+        sampler=sampler_instance,
+    )
+    pipe.fit(x_train, y_train)
+
+    y_pred = np.asarray(pipe.predict(x_test), dtype=int)
+    y_score = get_scores(pipe, x_test)
+    y_test_np = np.asarray(y_test, dtype=int)
+
+    metrics = compute_metrics(y_test_np, y_pred, y_score)
+    metrics.update(
+        {
+            "scenario": scenario_name,
+            "model": model_name,
+            "fold": fold_id,
+        }
+    )
+
+    return {
+        "metrics": metrics,
+        "y_true": y_test_np,
+        "y_pred": y_pred,
+        "y_score": y_score,
+    }
+
+
 def run_cv_experiments(
     x: pd.DataFrame,
     y: pd.Series,
     model_catalog: dict[str, dict[str, Any]],
     scenario_catalog: dict[str, Any],
     n_splits: int,
+    n_jobs: int = -1,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, np.ndarray]]]:
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
     total_scenarios = len(scenario_catalog)
@@ -314,9 +368,6 @@ def run_cv_experiments(
         )
         for model_idx, (model_name, cfg) in enumerate(model_catalog.items(), start=1):
             key = f"{scenario_name}__{model_name}"
-            y_true_all: list[np.ndarray] = []
-            y_score_all: list[np.ndarray] = []
-            y_pred_all: list[np.ndarray] = []
 
             print(
                 (
@@ -326,49 +377,41 @@ def run_cv_experiments(
                 flush=True,
             )
 
-            for fold_id, (idx_train, idx_test) in enumerate(splits, start=1):
-                print(
-                    (
-                        f"[3/6]     Fold {fold_id}/{n_splits} iniciado "
-                        f"| cenario={scenario_name} | modelo={model_name}"
-                    ),
-                    flush=True,
+            fold_tasks = [
+                delayed(_process_fold)(
+                    x_values,
+                    y_values,
+                    idx_train,
+                    idx_test,
+                    cfg["model"],
+                    cfg["scale"],
+                    sampler,
+                    scenario_name,
+                    model_name,
+                    fold_id,
                 )
-                x_train, x_test = x_values[idx_train], x_values[idx_test]
-                y_train, y_test = y_values[idx_train], y_values[idx_test]
+                for fold_id, (idx_train, idx_test) in enumerate(splits, start=1)
+            ]
 
-                sampler_instance = clone(sampler) if sampler is not None else None
-                model_instance = clone(cfg["model"])
-                pipe = build_pipeline(
-                    model=model_instance,
-                    use_scaler=bool(cfg["scale"]),
-                    sampler=sampler_instance,
-                )
-                pipe.fit(x_train, y_train)
+            fold_results = Parallel(n_jobs=n_jobs, verbose=1)(
+                fold_tasks
+            )
 
-                y_pred = np.asarray(pipe.predict(x_test), dtype=int)
-                y_score = get_scores(pipe, x_test)
-                y_test_np = np.asarray(y_test, dtype=int)
+            y_true_all: list[np.ndarray] = []
+            y_score_all: list[np.ndarray] = []
+            y_pred_all: list[np.ndarray] = []
 
-                metrics = compute_metrics(y_test_np, y_pred, y_score)
-                metrics.update(
-                    {
-                        "scenario": scenario_name,
-                        "model": model_name,
-                        "fold": fold_id,
-                    }
-                )
-                rows_fold.append(metrics)
-
-                y_true_all.append(y_test_np)
-                y_pred_all.append(y_pred)
-                y_score_all.append(y_score)
+            for fold_id, result in enumerate(fold_results, start=1):
+                rows_fold.append(result["metrics"])
+                y_true_all.append(result["y_true"])
+                y_pred_all.append(result["y_pred"])
+                y_score_all.append(result["y_score"])
 
                 print(
                     (
                         f"[3/6]     Fold {fold_id}/{n_splits} concluido "
                         f"| cenario={scenario_name} | modelo={model_name} "
-                        f"| recall={metrics['recall']:.4f} | pr_auc={metrics['pr_auc']:.4f}"
+                        f"| recall={result['metrics']['recall']:.4f} | pr_auc={result['metrics']['pr_auc']:.4f}"
                     ),
                     flush=True,
                 )
@@ -603,6 +646,7 @@ def main() -> None:
         model_catalog=model_catalog,
         scenario_catalog=scenario_catalog,
         n_splits=args.n_splits,
+        n_jobs=args.n_jobs,
     )
 
     print("[4/6] Salvando tabelas de metricas...", flush=True)
