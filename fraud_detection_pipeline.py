@@ -1,4 +1,3 @@
-''' primeira versão do pipeline de detecção de fraude com validação cruzada, comparação de modelos e técnicas de balanceamento, e geração de métricas e gráficos.'''
 from __future__ import annotations
 
 import argparse
