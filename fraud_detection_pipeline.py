@@ -42,6 +42,7 @@ from sklearn.svm import SVC
 RANDOM_STATE = 42
 N_SPLITS = 5
 DEFAULT_DATASET_NAME = "creditcard.csv"
+FAST_MODE_DEFAULT_MAX_ROWS = 120_000
 
 
 def get_project_dir() -> Path:
@@ -84,6 +85,26 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Remove SVM da comparacao (util para execucao rapida em datasets grandes).",
     )
+    parser.add_argument(
+        "--n-splits",
+        type=int,
+        default=N_SPLITS,
+        help="Numero de folds na validacao cruzada (padrao: 5).",
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="Limita quantidade de linhas carregadas do dataset.",
+    )
+    parser.add_argument(
+        "--fast-mode",
+        action="store_true",
+        help=(
+            "Modo rapido para iteracao local: reduz folds para 3, desativa SVM e limita "
+            "linhas (se --max-rows nao for informado)."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -105,13 +126,19 @@ def ensure_output_dirs(output_dir: Path) -> dict[str, Path]:
     return {"base": output_dir, "tables": tables, "figures": figures}
 
 
-def load_data(path: Path) -> pd.DataFrame:
+def load_data(path: Path, max_rows: int | None = None) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Arquivo nao encontrado: {path}")
 
-    df = pd.read_csv(path)
+    df = pd.read_csv(path, nrows=max_rows)
     if "Class" not in df.columns:
         raise ValueError("Dataset deve conter a coluna alvo 'Class'.")
+
+    float64_cols = df.select_dtypes(include=["float64"]).columns
+    if len(float64_cols) > 0:
+        df[float64_cols] = df[float64_cols].astype(np.float32)
+
+    df["Class"] = df["Class"].astype(np.int8)
 
     return df
 
@@ -221,7 +248,13 @@ def make_model_catalog(include_rf: bool, include_svm: bool = True) -> dict[str, 
 
     if include_svm:
         catalog["svm_rbf"] = {
-            "model": SVC(kernel="rbf", probability=True, class_weight=None, random_state=RANDOM_STATE),
+            "model": SVC(
+                kernel="rbf",
+                probability=True,
+                class_weight=None,
+                random_state=RANDOM_STATE,
+                cache_size=700,
+            ),
             "scale": True,
         }
 
@@ -262,10 +295,14 @@ def run_cv_experiments(
     y: pd.Series,
     model_catalog: dict[str, dict[str, Any]],
     scenario_catalog: dict[str, Any],
+    n_splits: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, dict[str, np.ndarray]]]:
-    skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=RANDOM_STATE)
     total_scenarios = len(scenario_catalog)
     total_models = len(model_catalog)
+    x_values = x.to_numpy(copy=False)
+    y_values = y.to_numpy(dtype=np.int8, copy=False)
+    splits = list(skf.split(x_values, y_values))
 
     rows_fold: list[dict[str, Any]] = []
     oof_store: dict[str, dict[str, np.ndarray]] = {}
@@ -289,16 +326,16 @@ def run_cv_experiments(
                 flush=True,
             )
 
-            for fold_id, (idx_train, idx_test) in enumerate(skf.split(x, y), start=1):
+            for fold_id, (idx_train, idx_test) in enumerate(splits, start=1):
                 print(
                     (
-                        f"[3/6]     Fold {fold_id}/{N_SPLITS} iniciado "
+                        f"[3/6]     Fold {fold_id}/{n_splits} iniciado "
                         f"| cenario={scenario_name} | modelo={model_name}"
                     ),
                     flush=True,
                 )
-                x_train, x_test = x.iloc[idx_train], x.iloc[idx_test]
-                y_train, y_test = y.iloc[idx_train], y.iloc[idx_test]
+                x_train, x_test = x_values[idx_train], x_values[idx_test]
+                y_train, y_test = y_values[idx_train], y_values[idx_test]
 
                 sampler_instance = clone(sampler) if sampler is not None else None
                 model_instance = clone(cfg["model"])
@@ -329,7 +366,7 @@ def run_cv_experiments(
 
                 print(
                     (
-                        f"[3/6]     Fold {fold_id}/{N_SPLITS} concluido "
+                        f"[3/6]     Fold {fold_id}/{n_splits} concluido "
                         f"| cenario={scenario_name} | modelo={model_name} "
                         f"| recall={metrics['recall']:.4f} | pr_auc={metrics['pr_auc']:.4f}"
                     ),
@@ -375,7 +412,6 @@ def run_cv_experiments(
     summary = (
         fold_df.groupby(["scenario", "model"], as_index=False)[metric_cols]
         .agg(["mean", "std"])
-        .reset_index()
     )
     summary.columns = [
         "scenario",
@@ -527,11 +563,29 @@ def save_best_config_report(
 
 def main() -> None:
     args = parse_args()
+
+    if args.fast_mode:
+        if not args.no_svm:
+            print("[0/6] fast-mode: desativando SVM para reduzir tempo de execucao.", flush=True)
+            args.no_svm = True
+        if args.n_splits == N_SPLITS:
+            args.n_splits = 3
+            print("[0/6] fast-mode: usando 3 folds na validacao cruzada.", flush=True)
+        if args.max_rows is None:
+            args.max_rows = FAST_MODE_DEFAULT_MAX_ROWS
+            print(
+                f"[0/6] fast-mode: limitando carga para {FAST_MODE_DEFAULT_MAX_ROWS} linhas.",
+                flush=True,
+            )
+
+    if args.n_splits < 2:
+        raise ValueError("--n-splits deve ser >= 2.")
+
     data_path = resolve_data_path(args.data)
     paths = ensure_output_dirs(args.output_dir)
 
     print(f"[1/6] Carregando dados de: {data_path}", flush=True)
-    df = load_data(data_path)
+    df = load_data(data_path, max_rows=args.max_rows)
 
     print("[2/6] Gerando artefatos de EDA...", flush=True)
     generate_eda_artifacts(df, paths["tables"], paths["figures"])
@@ -548,6 +602,7 @@ def main() -> None:
         y=y,
         model_catalog=model_catalog,
         scenario_catalog=scenario_catalog,
+        n_splits=args.n_splits,
     )
 
     print("[4/6] Salvando tabelas de metricas...", flush=True)
